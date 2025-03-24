@@ -1,3 +1,5 @@
+pub mod temp;
+
 /// CLI for rust-cktap
 use clap::{Parser, Subcommand};
 use rpassword::read_password;
@@ -10,6 +12,7 @@ use rust_cktap::secp256k1::rand;
 use rust_cktap::{apdu::Error, commands::Certificate, rand_chaincode, CkTapCard};
 use std::io;
 use std::io::Write;
+use temp::{SetupCmd, TapSignerCmd, TapSignerReader, TapSignerResponse};
 
 /// SatsCard CLI
 #[derive(Parser)]
@@ -67,32 +70,37 @@ enum TapSignerCommand {
     },
     /// Get a an encrypted backup of the card's private key
     Backup,
+
     /// Change the PIN (CVC) used for card authentication to a new user provided one
-    Change { new_cvc: String },
+    Change {
+        new_cvc: String,
+    },
+
+    Setup,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // figure out what type of card we have before parsing cli args
     #[cfg(not(feature = "emulator"))]
-    let mut card = pcsc::find_first().await?;
+    let card = pcsc::find_first().await?;
 
     // if emulator feature enabled override pcsc card
     #[cfg(feature = "emulator")]
-    let mut card = emulator::find_emulator().await?;
+    let card = emulator::find_emulator().await?;
 
     let rng = &mut rand::thread_rng();
 
-    match &mut card {
-        CkTapCard::SatsCard(sc) => {
+    match card {
+        CkTapCard::SatsCard(mut sc) => {
             let cli = SatsCardCli::parse();
             match cli.command {
                 SatsCardCommand::Debug => {
                     dbg!(&sc);
                 }
                 SatsCardCommand::Address => println!("Address: {}", sc.address().unwrap()),
-                SatsCardCommand::Certs => check_cert(sc).await,
-                SatsCardCommand::Read => read(sc, None).await,
+                SatsCardCommand::Certs => check_cert(&mut sc).await,
+                SatsCardCommand::Read => read(&mut sc, None).await,
                 SatsCardCommand::New => {
                     let slot = sc.slot().expect("current slot number");
                     let chain_code = Some(rand_chaincode(rng));
@@ -109,21 +117,21 @@ async fn main() -> Result<(), Error> {
                 }
             }
         }
-        CkTapCard::TapSigner(ts) | CkTapCard::SatsChip(ts) => {
+        CkTapCard::TapSigner(mut ts) | CkTapCard::SatsChip(mut ts) => {
             let cli = TapSignerCli::parse();
             match cli.command {
                 TapSignerCommand::Debug => {
                     dbg!(&ts);
                 }
-                TapSignerCommand::Certs => check_cert(ts).await,
-                TapSignerCommand::Read => read(ts, Some(cvc())).await,
+                TapSignerCommand::Certs => check_cert(&mut ts).await,
+                TapSignerCommand::Read => read(&mut ts, Some(cvc())).await,
                 TapSignerCommand::Init => {
                     let chain_code = rand_chaincode(rng);
                     let response = &ts.init(chain_code, &cvc()).await;
                     dbg!(response);
                 }
                 TapSignerCommand::Derive { path } => {
-                    dbg!(&ts.derive(path, cvc()).await);
+                    dbg!(&ts.derive(path.as_slice(), &cvc()).await);
                 }
 
                 TapSignerCommand::Backup => {
@@ -134,6 +142,25 @@ async fn main() -> Result<(), Error> {
                 TapSignerCommand::Change { new_cvc } => {
                     let response = &ts.change(&new_cvc, &cvc()).await;
                     println!("{:?}", response);
+                }
+
+                TapSignerCommand::Setup => {
+                    let setup_cmd = SetupCmd {
+                        factory_pin: "123456".to_string(),
+                        new_pin: "000000".to_string(),
+                        chain_code: rand_chaincode(&mut rand::thread_rng()),
+                    };
+
+                    let cmd = TapSignerCmd::Setup(setup_cmd.into());
+                    let ts = TapSignerReader::new(ts, Some(cmd)).await.unwrap();
+                    match ts.run().await {
+                        Ok(TapSignerResponse::Setup(response)) => {
+                            println!("Success {:?}", response);
+                        }
+                        Err(e) => {
+                            eprintln!("TapSignerReaderError: {:?}", e);
+                        }
+                    }
                 }
             }
         }
