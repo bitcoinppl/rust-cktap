@@ -7,7 +7,7 @@ use secp256k1::{
 use crate::apdu::{
     tap_signer::{BackupCommand, BackupResponse, ChangeCommand, ChangeResponse},
     AppletSelect, CommandApdu as _, DeriveCommand, DeriveResponse, Error, NewCommand, NewResponse,
-    StatusResponse,
+    StatusCommand, StatusResponse,
 };
 use crate::commands::{Authentication, Certificate, CkTransport, Read, Wait};
 
@@ -109,6 +109,12 @@ impl<T: CkTransport> TapSigner<T> {
         Ok(new_response)
     }
 
+    pub async fn status(&mut self) -> Result<StatusResponse, Error> {
+        let cmd = StatusCommand::default();
+        let status_response: StatusResponse = self.transport.transmit(&cmd).await?;
+        Ok(status_response)
+    }
+
     pub async fn derive(
         &mut self,
         path: &[u32],
@@ -121,13 +127,16 @@ impl<T: CkTransport> TapSigner<T> {
         let app_nonce = crate::rand_nonce();
         let (_, epubkey, xcvc) = self.calc_ekeys_xcvc(cvc, DeriveCommand::name());
 
-        let cmd = AppletSelect::default();
-        let status_response: StatusResponse = self.transport.transmit(&cmd).await?;
-
-        assert_eq!(status_response.card_nonce, card_nonce);
-
         let cmd = DeriveCommand::for_tapsigner(app_nonce, path, epubkey, xcvc);
         let derive_response: DeriveResponse = self.transport.transmit(&cmd).await?;
+        self.card_nonce = derive_response.card_nonce;
+
+        let status = self.status().await?;
+        println!(
+            "status nonce: {:?}, card_nonce: {:?}",
+            status.card_nonce, card_nonce
+        );
+
         let sig = &derive_response.sig;
 
         let mut message_bytes: Vec<u8> = Vec::new();
@@ -146,16 +155,10 @@ impl<T: CkTransport> TapSigner<T> {
                 .map_err(Error::from)?,
         };
 
-        // TODO: actually return as error when we can figure out why its not working on the card
-        if let Err(e) = self
-            .secp()
+        self.secp()
             .verify_ecdsa(&message, &signature, &pubkey)
-            .map_err(Error::from)
-        {
-            println!("verify ecdsa failed: {e:?}");
-        };
+            .map_err(Error::from)?;
 
-        self.card_nonce = derive_response.card_nonce;
         Ok(derive_response)
     }
 
