@@ -127,21 +127,18 @@ impl<T: CkTransport> TapSigner<T> {
         let app_nonce = crate::rand_nonce();
         let (_, epubkey, xcvc) = self.calc_ekeys_xcvc(cvc, DeriveCommand::name());
 
+        let status = self.status().await?;
+        assert_eq!(status.card_nonce, card_nonce);
+
         let cmd = DeriveCommand::for_tapsigner(app_nonce, path, epubkey, xcvc);
         let derive_response: DeriveResponse = self.transport.transmit(&cmd).await?;
         self.card_nonce = derive_response.card_nonce;
-
-        let status = self.status().await?;
-        println!(
-            "status nonce: {:?}, card_nonce: {:?}",
-            status.card_nonce, card_nonce
-        );
 
         let sig = &derive_response.sig;
 
         let mut message_bytes: Vec<u8> = Vec::new();
         message_bytes.extend("OPENDIME".as_bytes());
-        message_bytes.extend(card_nonce);
+        message_bytes.extend(status.card_nonce);
         message_bytes.extend(app_nonce);
         message_bytes.extend(&derive_response.chain_code);
 
