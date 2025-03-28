@@ -6,7 +6,7 @@ use secp256k1::{
 
 use crate::apdu::{
     tap_signer::{BackupCommand, BackupResponse, ChangeCommand, ChangeResponse},
-    CommandApdu as _, DeriveCommand, DeriveResponse, Error, NewCommand, NewResponse,
+    AppletSelect, CommandApdu as _, DeriveCommand, DeriveResponse, Error, NewCommand, NewResponse,
     StatusResponse,
 };
 use crate::commands::{Authentication, Certificate, CkTransport, Read, Wait};
@@ -114,14 +114,20 @@ impl<T: CkTransport> TapSigner<T> {
         path: &[u32],
         cvc: &str,
     ) -> Result<DeriveResponse, TapSignerError> {
+        let card_nonce = *self.card_nonce();
+
         // set most significant bit to 1 to represent hardened path steps
         let path = path.iter().map(|p| p ^ (1 << 31)).collect();
         let app_nonce = crate::rand_nonce();
         let (_, epubkey, xcvc) = self.calc_ekeys_xcvc(cvc, DeriveCommand::name());
+
+        let cmd = AppletSelect::default();
+        let status_response: StatusResponse = self.transport.transmit(&cmd).await?;
+
+        assert_eq!(status_response.card_nonce, card_nonce);
+
         let cmd = DeriveCommand::for_tapsigner(app_nonce, path, epubkey, xcvc);
         let derive_response: DeriveResponse = self.transport.transmit(&cmd).await?;
-
-        let card_nonce = self.card_nonce();
         let sig = &derive_response.sig;
 
         let mut message_bytes: Vec<u8> = Vec::new();
