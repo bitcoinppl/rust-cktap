@@ -30,6 +30,8 @@ pub enum Error {
     IncorrectSignature(String),
     #[error("UnknownCardType: {0}")]
     UnknownCardType(String),
+    #[error("ConnectionLost: {0}")]
+    ConnectionLost(String),
 
     #[cfg(feature = "pcsc")]
     #[error("PcSc: {0}")]
