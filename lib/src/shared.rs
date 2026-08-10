@@ -299,9 +299,9 @@ pub trait Certificate: Read {
 
         let check_cmd = CheckCommand::new(app_nonce);
         let check_response: CheckResponse = transmit(self.transport(), &check_cmd).await?;
-        let signature = parse_auth_signature(&check_response.auth_sig)?;
-
         self.set_card_nonce(check_response.card_nonce);
+
+        let signature = parse_auth_signature(&check_response.auth_sig)?;
 
         let slot_pubkey = self.slot_pubkey().await?;
 
@@ -394,6 +394,51 @@ fn parse_certificate_signature(certificate: &[u8]) -> Result<RecoverableSignatur
 #[cfg(test)]
 mod certificate_tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(serde::Serialize)]
+    struct CertsResponseBody {
+        cert_chain: Vec<serde_bytes::ByteBuf>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct CheckResponseBody {
+        #[serde(with = "serde_bytes")]
+        auth_sig: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        card_nonce: [u8; 16],
+    }
+
+    struct QueuedTransport(Mutex<VecDeque<Vec<u8>>>);
+
+    #[async_trait]
+    impl CkTransport for QueuedTransport {
+        async fn transmit_apdu(&self, _command_apdu: Vec<u8>) -> Result<Vec<u8>, CkTapError> {
+            self.0
+                .lock()
+                .expect("response queue lock")
+                .pop_front()
+                .ok_or_else(|| CkTapError::Transport("response queue is empty".to_string()))
+        }
+    }
+
+    fn serialize_response(response: &impl serde::Serialize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(response, &mut bytes).expect("serializable response");
+        bytes
+    }
+
+    fn certificate_signature(secp: &Secp256k1<All>) -> Vec<u8> {
+        let secret_key = secp256k1::SecretKey::from_slice(&[1; 32]).expect("valid secret key");
+        let message = Message::from_digest([2; 32]);
+        let signature = secp.sign_ecdsa_recoverable(&message, &secret_key);
+        let (recovery_id, compact_signature) = signature.serialize_compact();
+        let mut certificate = Vec::with_capacity(65);
+        certificate.push(27 + recovery_id.to_i32() as u8);
+        certificate.extend(compact_signature);
+        certificate
+    }
 
     #[test]
     fn rejects_invalid_auth_signature_length() {
@@ -402,6 +447,45 @@ mod certificate_tests {
             error,
             CertsError::Secp256k1(bitcoin::secp256k1::Error::InvalidSignature)
         ));
+    }
+
+    #[tokio::test]
+    async fn stores_response_nonce_before_parsing_auth_signature() {
+        let initial_nonce = [3; 16];
+        let response_nonce = [4; 16];
+        let secp = Secp256k1::new();
+        let secret_key = secp256k1::SecretKey::from_slice(&[1; 32]).expect("valid secret key");
+        let pubkey = PublicKey::new(secret_key.public_key(&secp));
+        let responses = VecDeque::from([
+            serialize_response(&CertsResponseBody {
+                cert_chain: vec![serde_bytes::ByteBuf::from(certificate_signature(&secp))],
+            }),
+            serialize_response(&CheckResponseBody {
+                auth_sig: Vec::new(),
+                card_nonce: response_nonce,
+            }),
+        ]);
+        let transport = Arc::new(QueuedTransport(Mutex::new(responses)));
+        let mut card = SatsCard {
+            transport,
+            secp,
+            proto: 1,
+            ver: "1.0.0".to_string(),
+            birth: 0,
+            slots: (0, 10),
+            addr: None,
+            pubkey,
+            card_nonce: initial_nonce,
+            auth_delay: None,
+        };
+
+        let error = card.check_certificate().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            CertsError::Secp256k1(bitcoin::secp256k1::Error::InvalidSignature)
+        ));
+        assert_eq!(card.card_nonce, response_nonce);
     }
 
     #[test]
