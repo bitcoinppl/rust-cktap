@@ -20,12 +20,30 @@ use bitcoin::secp256k1::{self, All, Message, Secp256k1, ecdsa::Signature};
 use bitcoin_hashes::sha256;
 use std::sync::Arc;
 
-const BIP84_PATH_LEN: u32 = 5;
+const BIP84_PATH_LEN: usize = 5;
 
-// BIP84 derivation path structure, m / 84' / 0' / account' / change / address_index
+// BIP84 derivation path structure: m / 84' / coin_type' / account' / change / address_index
+// The TAPSIGNER holds the account-level key (first three hardened steps). Signing uses the
+// remaining unhardened change / address_index sub-path relative to that account key.
+const BIP84_ACCOUNT_PATH_LEN: usize = 3;
 
-// Derivation sub-path indexes that must be hardened
-const BIP84_HARDENED_SUBPATH: [u32; 3] = [0, 1, 2];
+/// Splits a BIP84 path into (account path for derive, unhardened sign sub-path).
+///
+/// Returns `None` when the path is not a 5-step BIP84 path with a hardened account prefix and
+/// an unhardened change / address_index suffix.
+fn bip84_account_and_sign_subpath(path: &[u32]) -> Option<(&[u32], Vec<u32>)> {
+    if path.len() != BIP84_PATH_LEN {
+        return None;
+    }
+    let account_path = &path[..BIP84_ACCOUNT_PATH_LEN];
+    let sub_path = path[BIP84_ACCOUNT_PATH_LEN..].to_vec();
+    if account_path.iter().any(|p| *p & BIP32_HARDENED_MASK == 0)
+        || sub_path.iter().any(|p| *p & BIP32_HARDENED_MASK != 0)
+    {
+        return None;
+    }
+    Some((account_path, sub_path))
+}
 
 pub struct TapSigner {
     pub transport: Arc<dyn CkTransport>,
@@ -180,15 +198,9 @@ pub trait TapSignerShared: Authentication {
                 .ok_or(SignPsbtError::MissingPubkey(input_index as u32))?;
 
             let path = path.to_u32_vec();
-
-            if path.len() as u32 != BIP84_PATH_LEN {
+            let Some((account_path, sub_path)) = bip84_account_and_sign_subpath(&path) else {
                 return Err(SignPsbtError::InvalidPath(input_index as u32));
-            }
-
-            let sub_path = BIP84_HARDENED_SUBPATH.map(|i| path[i as usize]);
-            if sub_path.iter().any(|p| *p > BIP32_HARDENED_MASK) {
-                return Err(SignPsbtError::InvalidPath(input_index as u32));
-            }
+            };
 
             // calculate sighash
             let script = script_pubkey.as_script();
@@ -199,26 +211,25 @@ pub trait TapSignerShared: Authentication {
             // the digest is the sighash
             let digest: &[u8; 32] = sighash.as_ref();
 
-            // send digest to TAPSIGNER for signing
-            let mut sign_response = self.sign(*digest, sub_path.to_vec(), cvc).await?;
+            // send digest to TAPSIGNER for signing at change/address relative to the account key
+            let mut sign_response = self.sign(*digest, sub_path.clone(), cvc).await?;
             let mut signature_raw = sign_response.sig;
 
             // verify that TAPSIGNER used the same public key as the PSBT
             if sign_response.pubkey != psbt_pubkey.serialize() {
-                // try deriving the TAPSIGNER and try again
-                // take the hardened path and remove the hardened bit, because `sign` hardens it
-                let path: Vec<u32> = path
-                    .into_iter()
+                // Card may still be at the master key — derive the BIP84 account path and retry.
+                // `derive` re-applies the hardened bit, so strip it from the account steps first.
+                let derive_path: Vec<u32> = account_path
+                    .iter()
                     .map(|p| p ^ BIP32_HARDENED_MASK)
-                    .take(BIP84_HARDENED_SUBPATH.len())
                     .collect();
-                let derive_response = self.derive(path, cvc).await;
+                let derive_response = self.derive(derive_path, cvc).await;
                 if derive_response.is_err() {
                     return Err(SignPsbtError::PubkeyMismatch(input_index as u32));
                 }
 
                 // update signature to the new one we just derived
-                sign_response = self.sign(*digest, sub_path.to_vec(), cvc).await?;
+                sign_response = self.sign(*digest, sub_path.clone(), cvc).await?;
                 signature_raw = sign_response.sig;
 
                 // if still not matching, return error
@@ -405,6 +416,44 @@ impl core::fmt::Debug for TapSigner {
             .field("card_nonce", &self.card_nonce.to_lower_hex_string())
             .field("auth_delay", &self.auth_delay)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn bip84_path_accepts_hardened_account_and_unhardened_address() {
+        let path = [
+            84 | BIP32_HARDENED_MASK,
+            BIP32_HARDENED_MASK, // coin_type' = 0'
+            BIP32_HARDENED_MASK, // account' = 0'
+            0,                   // change
+            5,                   // address_index
+        ];
+        let (account, sub) = bip84_account_and_sign_subpath(&path).expect("valid BIP84 path");
+        assert_eq!(account, &path[..3]);
+        assert_eq!(sub, vec![0, 5]);
+    }
+
+    #[test]
+    fn bip84_path_rejects_unhardened_account_prefix() {
+        // old bug rejected hardened prefixes; the correct rule rejects *unhardened* ones
+        let path = [84, 0, 0, 0, 1];
+        assert!(bip84_account_and_sign_subpath(&path).is_none());
+    }
+
+    #[test]
+    fn bip84_path_rejects_hardened_address_steps() {
+        let path = [
+            84 | BIP32_HARDENED_MASK,
+            BIP32_HARDENED_MASK,
+            BIP32_HARDENED_MASK,
+            0 | BIP32_HARDENED_MASK,
+            1,
+        ];
+        assert!(bip84_account_and_sign_subpath(&path).is_none());
     }
 }
 
